@@ -1,0 +1,60 @@
+# BTC ML Pipeline Configuration
+# All tunable parameters live here. Adjust thresholds and windows before retraining.
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  pair: "XBTUSD"
+  history_days: 90                  # Days of history to download
+
+# ── Short-Term Model ──────────────────────────────────────────────────────────
+short_term:
+  interval_min: 1                   # Candle granularity in minutes
+  lookback_candles: 60              # Feature window: 60 1-min candles = 60 min
+  horizon_candles: 15               # Predict this many candles ahead (= 15 min)
+  up_threshold_pct: 0.70            # Label UP if gain >= this % in horizon
+  down_threshold_pct: 0.70          # Label DOWN if drop >= this % in horizon
+  eval_folds: 30                    # Number of rolling evaluation windows
+
+# ── Long-Term Model ───────────────────────────────────────────────────────────
+long_term:
+  interval_min: 1440                # Daily candles (1440 min = 1 day)
+  lookback_days: 30                 # Feature window: 30 daily candles
+  horizon_days: 1                   # Predict next day
+  up_threshold_pct: 0.75            # Label UP if next-day gain >= this %
+  down_threshold_pct: 0.75          # Label DOWN if next-day drop >= this %
+  eval_folds: 10                    # Number of rolling evaluation windows (min 10)
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  type: "lightgbm"                  # Options: lightgbm | xgboost | gradient_boosting
+  n_estimators: 300
+  learning_rate: 0.05
+  max_depth: 6
+  num_leaves: 31
+  class_weight: "balanced"          # Handles class imbalance automatically
+  random_state: 42
+
+# ── ZigZag ────────────────────────────────────────────────────────────────────
+zigzag:
+  threshold_pct: 0.80               # Min % reversal to define a swing extreme
+
+# ── Fees (Kraken spot trading) ────────────────────────────────────────────────
+fees:
+  taker_pct: 0.26
+  spread_est_pct: 0.10
+  round_trip_pct: 0.62              # Total cost: 1 buy + 1 sell cycle
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+evaluation:
+  min_precision_threshold: 0.55     # Below this → model not reliable for live use
+  report_output_dir: "reports"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+paths:
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  btc_1min_file: "data/raw/btc_1min.parquet"
+  btc_daily_file: "data/raw/btc_daily.parquet"
+  sentiment_file: "data/raw/sentiment_daily.parquet"
+  features_short_file: "data/processed/features_short.parquet"
+  features_long_file: "data/processed/features_long.parquet"
