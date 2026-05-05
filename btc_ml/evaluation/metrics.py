@@ -40,12 +40,7 @@ def compute_metrics(
     n_pos = int(y_true.sum())
     n_neg = int(len(y_true) - n_pos)
 
-    if n_pos == 0 or n_neg == 0:
-        logger.warning(
-            "Single class in y_true (%d pos, %d neg). Metrics will be degenerate.",
-            n_pos,
-            n_neg,
-        )
+    if len(y_true) == 0:
         return {
             "accuracy": float("nan"),
             "precision": float("nan"),
@@ -53,6 +48,23 @@ def compute_metrics(
             "f1": float("nan"),
             "auc": float("nan"),
             "mcc": float("nan"),
+            "n_samples": 0,
+            "n_pos": 0,
+            "n_neg": 0,
+        }
+
+    accuracy = float(accuracy_score(y_true, y_pred))
+    
+    if n_pos == 0 or n_neg == 0:
+        # Single class case: Precision/Recall/AUC/MCC are often undefined or degenerate
+        # We return what we can (accuracy) and 0/NaN for others
+        return {
+            "accuracy": accuracy,
+            "precision": float(precision_score(y_true, y_pred, zero_division=np.nan)),
+            "recall": float(recall_score(y_true, y_pred, zero_division=np.nan)),
+            "f1": float(f1_score(y_true, y_pred, zero_division=np.nan)),
+            "auc": 0.5, # Random baseline for single class
+            "mcc": 0.0,
             "n_samples": len(y_true),
             "n_pos": n_pos,
             "n_neg": n_neg,

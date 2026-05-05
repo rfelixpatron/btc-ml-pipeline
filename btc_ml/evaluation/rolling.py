@@ -58,23 +58,24 @@ class RollingEvaluator:
         
         # Features restricted to last 24h for window selection
         pool = features[features.index >= start_ts]
-        if len(pool) < 60:
-            logger.warning("Less than 60 mins of data in last 24h. Using available.")
-            n_windows = 1
-        
-        # Select N start times evenly spread across the last 24h (avoiding the very end)
-        window_starts = pd.date_range(
-            start=start_ts, 
-            end=last_ts - pd.Timedelta(hours=1, minutes=15), 
-            periods=n_windows
-        )
+        horizon = self.config.short_term.horizon_candles
+        # Select N start times directly from available indices to avoid data gaps
+        pool_indices = pool.index
+        if len(pool_indices) < 60:
+            window_starts = [pool_indices[0]] if len(pool_indices) > 0 else []
+        else:
+            # We need at least 60 mins of data after the start point
+            max_idx = len(pool_indices) - 60 - horizon
+            if max_idx <= 0:
+                window_starts = [pool_indices[0]]
+            else:
+                sel_indices = np.linspace(0, max_idx, n_windows, dtype=int)
+                window_starts = pool_indices[sel_indices]
 
         results_up, results_down = [], []
         detailed_folds = []
         cm_up_total = np.zeros((2, 2), dtype=int)
         cm_down_total = np.zeros((2, 2), dtype=int)
-
-        horizon = self.config.short_term.horizon_candles
 
         for i, start in enumerate(window_starts):
             end = start + pd.Timedelta(hours=1)
