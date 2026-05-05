@@ -74,30 +74,23 @@ class KrakenDownloader:
         )
         return df
 
-    def download_daily(self, days: int = 90) -> pd.DataFrame:
-        """Download daily OHLCV candles.
+    def download_daily(self, days: int = 90, since_ts: int | None = None) -> pd.DataFrame:
+        """Download daily OHLCV candles."""
+        if since_ts:
+            logger.info("Incremental download: Daily candles since %s", datetime.fromtimestamp(since_ts, tz=timezone.utc))
+        else:
+            logger.info("Downloading daily candles for %s (last %d days)", self.pair, days)
+            since_ts = int(
+                (datetime.now(timezone.utc) - timedelta(days=days + 5)).timestamp()
+            )
 
-        Kraken's daily interval (1440 min) returns up to 720 candles
-        (~2 years) in a single call. We trim to the requested number of days.
-
-        Args:
-            days: Number of recent days to return.
-
-        Returns:
-            DataFrame with DatetimeIndex (UTC) and OHLCV columns.
-        """
-        logger.info("Downloading daily candles for %s (last %d days)", self.pair, days)
-
-        # Daily data fits in one call; use a far-back `since` to get full history
-        since_ts = int(
-            (datetime.now(timezone.utc) - timedelta(days=days + 5)).timestamp()
-        )
         candles = self._paginate(interval=1440, since=since_ts)
         df = self._to_dataframe(candles)
 
-        # Trim to requested days
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        df = df[df.index >= cutoff]
+        if not since_ts:
+            # Trim to requested days only if it's a full download
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            df = df[df.index >= cutoff]
 
         logger.info("Daily download complete: %d candles", len(df))
         return df

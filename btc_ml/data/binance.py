@@ -48,22 +48,25 @@ class BinanceDownloader:
         self.symbol = symbol
         self.request_delay = request_delay
 
-    def download_1min(self, days: int = 90) -> pd.DataFrame:
-        """Download 1-minute OHLCV candles for the past N days.
-
-        Paginates backward from now using startTime, fetching 1000 candles
-        per call until the full requested history is collected.
+    def download_1min(self, days: int = 90, since_ts: int | None = None) -> pd.DataFrame:
+        """Download 1-minute OHLCV candles.
 
         Args:
-            days: Number of calendar days of history to request.
+            days: Number of calendar days of history to ensure.
+            since_ts: Optional unix timestamp (seconds) to start from. 
+                      If provided, 'days' is ignored and we fetch from this point to now.
 
         Returns:
             DataFrame with UTC DatetimeIndex and columns:
             open, high, low, close, vwap, volume, count.
         """
-        start_ms = int(
-            (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
-        )
+        if since_ts:
+            start_ms = since_ts * 1000
+            logger.info("Incremental download: Fetching from %s", datetime.fromtimestamp(since_ts, tz=timezone.utc))
+        else:
+            start_ms = int(
+                (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+            )
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         logger.info(
