@@ -21,14 +21,11 @@ logger = get_logger(__name__)
 
 
 class RollingEvaluator:
-    """Walk-forward rolling evaluation engine.
+    """Walk-forward window-based evaluation engine.
 
-    Splits data chronologically into N folds. For each fold:
-    - Trains the model on all data before the test window
-    - Evaluates on the test window
-    - Reports per-fold metrics for UP and DOWN classifiers
-
-    This ensures no future data leaks into the training set.
+    Supports:
+    - Short-term: 1-hour test windows within the last 24h.
+    - Long-term: 30-day training windows followed by 1-day test.
 
     Args:
         model_class: Concrete subclass of BaseBTCClassifier.
@@ -43,137 +40,198 @@ class RollingEvaluator:
         self.model_class = model_class
         self.config = config
 
-    def evaluate(
+    def evaluate_short_term_windows(
         self,
         features: pd.DataFrame,
         label_up: pd.Series,
         label_down: pd.Series,
-        n_folds: int,
-        min_train_size: int | None = None,
-    ) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict]:
-        """Run rolling evaluation.
+        close_prices: pd.Series,
+        n_windows: int = 10,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict, list[pd.DataFrame]]:
+        """Evaluate in 1-hour windows within the last 24 hours.
 
-        Args:
-            features: Feature matrix (full dataset, chronological order).
-            label_up: Binary UP labels aligned to features.
-            label_down: Binary DOWN labels aligned to features.
-            n_folds: Number of rolling test windows.
-            min_train_size: Minimum number of rows for training. If None,
-                defaults to 60% of the total dataset.
-
-        Returns:
-            Tuple of:
-              - per_fold_up (DataFrame): Per-fold metrics for UP classifier.
-              - per_fold_down (DataFrame): Per-fold metrics for DOWN classifier.
-              - summary_up (dict): Aggregate mean/std across folds (UP).
-              - summary_down (dict): Aggregate mean/std across folds (DOWN).
+        Each fold trains on all data prior to the 1-hour window and
+        evaluates all 60 minutes within that window.
         """
-        n = len(features)
-        if min_train_size is None:
-            min_train_size = max(int(n * 0.60), 1)
-
-        test_pool_size = n - min_train_size
-        if test_pool_size < n_folds:
-            logger.warning(
-                "Only %d samples available for testing (%d requested folds). "
-                "Reducing to %d folds.",
-                test_pool_size,
-                n_folds,
-                test_pool_size,
-            )
-            n_folds = max(1, test_pool_size)
-
-        fold_size = test_pool_size // n_folds
-
-        logger.info(
-            "Rolling evaluation: %d folds | total=%d | train_min=%d | "
-            "test_per_fold=%d",
-            n_folds,
-            n,
-            min_train_size,
-            fold_size,
+        last_ts = features.index.max()
+        start_ts = last_ts - pd.Timedelta(hours=24)
+        
+        # Features restricted to last 24h for window selection
+        pool = features[features.index >= start_ts]
+        if len(pool) < 60:
+            logger.warning("Less than 60 mins of data in last 24h. Using available.")
+            n_windows = 1
+        
+        # Select N start times evenly spread across the last 24h (avoiding the very end)
+        window_starts = pd.date_range(
+            start=start_ts, 
+            end=last_ts - pd.Timedelta(hours=1, minutes=15), 
+            periods=n_windows
         )
 
-        results_up: list[dict] = []
-        results_down: list[dict] = []
-
-        # Accumulate confusion matrices across folds
+        results_up, results_down = [], []
+        detailed_folds = []
         cm_up_total = np.zeros((2, 2), dtype=int)
         cm_down_total = np.zeros((2, 2), dtype=int)
 
-        for fold_idx in range(n_folds):
-            test_start = min_train_size + fold_idx * fold_size
-            test_end = test_start + fold_size
+        horizon = self.config.short_term.horizon_candles
 
-            X_train = features.iloc[:test_start]
-            y_up_train = label_up.iloc[:test_start]
-            y_down_train = label_down.iloc[:test_start]
+        for i, start in enumerate(window_starts):
+            end = start + pd.Timedelta(hours=1)
+            
+            X_train = features[features.index < start]
+            y_up_train = label_up[label_up.index < start]
+            y_down_train = label_down[label_down.index < start]
 
-            X_test = features.iloc[test_start:test_end]
-            y_up_test = label_up.iloc[test_start:test_end]
-            y_down_test = label_down.iloc[test_start:test_end]
+            X_test = features[(features.index >= start) & (features.index < end)]
+            y_up_test = label_up[(label_up.index >= start) & (label_up.index < end)]
+            y_down_test = label_down[(label_down.index >= start) & (label_down.index < end)]
 
             if len(X_test) == 0:
-                break
+                continue
 
-            # Train model
             model = self.model_class(self.config.model)
             model.fit(X_train, y_up_train, y_down_train)
 
-            # Evaluate UP
             prob_up = model.predict_proba_up(X_test)
-            metrics_up = compute_metrics(y_up_test.values, prob_up)
-            ev_up = compute_expected_value(
-                precision=metrics_up["precision"],
-                avg_gain_pct=self.config.short_term.up_threshold_pct
-                if hasattr(self.config, "short_term")
-                else self.config.long_term.up_threshold_pct,
-                avg_loss_pct=self.config.fees.round_trip_pct,
-                round_trip_fee_pct=self.config.fees.round_trip_pct,
-            )
-            metrics_up["expected_value"] = ev_up
-            metrics_up["fold"] = fold_idx + 1
-            results_up.append(metrics_up)
-            cm_up_total += get_confusion_matrix(y_up_test.values, prob_up)
-
-            # Evaluate DOWN
             prob_down = model.predict_proba_down(X_test)
-            metrics_down = compute_metrics(y_down_test.values, prob_down)
-            ev_down = compute_expected_value(
-                precision=metrics_down["precision"],
-                avg_gain_pct=self.config.short_term.down_threshold_pct
-                if hasattr(self.config, "short_term")
-                else self.config.long_term.down_threshold_pct,
-                avg_loss_pct=self.config.fees.round_trip_pct,
-                round_trip_fee_pct=self.config.fees.round_trip_pct,
+
+            # Metrics
+            m_up = compute_metrics(y_up_test.values, prob_up)
+            m_down = compute_metrics(y_down_test.values, prob_down)
+            
+            # Expected Value
+            m_up["expected_value"] = compute_expected_value(
+                m_up["precision"], self.config.short_term.up_threshold_pct, 
+                self.config.fees.round_trip_pct, self.config.fees.round_trip_pct
             )
-            metrics_down["expected_value"] = ev_down
-            metrics_down["fold"] = fold_idx + 1
-            results_down.append(metrics_down)
+            m_down["expected_value"] = compute_expected_value(
+                m_down["precision"], self.config.short_term.down_threshold_pct, 
+                self.config.fees.round_trip_pct, self.config.fees.round_trip_pct
+            )
+
+            m_up["fold"], m_down["fold"] = i + 1, i + 1
+            results_up.append(m_up)
+            results_down.append(m_down)
+
+            cm_up_total += get_confusion_matrix(y_up_test.values, prob_up)
             cm_down_total += get_confusion_matrix(y_down_test.values, prob_down)
 
-            logger.info(
-                "Fold %2d/%d | UP  prec=%.3f rec=%.3f auc=%.3f ev=%.3f%% | "
-                "DOWN prec=%.3f rec=%.3f auc=%.3f ev=%.3f%%",
-                fold_idx + 1,
-                n_folds,
-                metrics_up["precision"],
-                metrics_up["recall"],
-                metrics_up["auc"],
-                ev_up,
-                metrics_down["precision"],
-                metrics_down["recall"],
-                metrics_down["auc"],
-                ev_down,
-            )
+            # Detailed results for this fold
+            df_fold = pd.DataFrame({
+                "timestamp": X_test.index,
+                "price_now": close_prices.reindex(X_test.index),
+                "price_future": close_prices.shift(-horizon).reindex(X_test.index),
+                "label_up": y_up_test.values,
+                "label_down": y_down_test.values,
+                "prob_up": prob_up,
+                "prob_down": prob_down,
+            })
+            df_fold["return_pct"] = (df_fold["price_future"] / df_fold["price_now"] - 1) * 100
+            df_fold["pred_up"] = (df_fold["prob_up"] >= 0.5).astype(int)
+            df_fold["pred_down"] = (df_fold["prob_down"] >= 0.5).astype(int)
+            detailed_folds.append(df_fold)
+
+            logger.info("Fold %d: %s to %s | %d samples", i+1, start, end, len(X_test))
 
         per_fold_up = pd.DataFrame(results_up).set_index("fold")
         per_fold_down = pd.DataFrame(results_down).set_index("fold")
-        summary_up = aggregate_fold_results(results_up)
-        summary_down = aggregate_fold_results(results_down)
-
-        # Attach confusion matrices for report generation
         per_fold_up.attrs["confusion_matrix"] = cm_up_total
         per_fold_down.attrs["confusion_matrix"] = cm_down_total
 
-        return per_fold_up, per_fold_down, summary_up, summary_down
+        return per_fold_up, per_fold_down, aggregate_fold_results(results_up), aggregate_fold_results(results_down), detailed_folds
+
+    def evaluate_long_term_windows(
+        self,
+        features: pd.DataFrame,
+        label_up: pd.Series,
+        label_down: pd.Series,
+        close_prices: pd.Series,
+        n_windows: int = 15,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict, list[pd.DataFrame]]:
+        """Evaluate with sliding 30-day training windows and 1-day test."""
+        # Find valid start dates that have 30 days of history + 1 day for test
+        available_dates = features.index.normalize().unique()
+        
+        # We need at least 32 days (30 train, 1 test, 1 for buffer)
+        if len(available_dates) < 32:
+            n_windows = 1
+            start_indices = [0]
+        else:
+            # Spread start dates across the available history
+            # Leave room at the end for 30d train + 1d test
+            max_start_idx = len(available_dates) - 32
+            start_indices = np.linspace(0, max_start_idx, n_windows, dtype=int)
+
+        results_up, results_down = [], []
+        detailed_folds = []
+        cm_up_total = np.zeros((2, 2), dtype=int)
+        cm_down_total = np.zeros((2, 2), dtype=int)
+
+        horizon = self.config.long_term.horizon_days
+
+        for i, idx in enumerate(start_indices):
+            d_start = available_dates[idx]
+            d_test = available_dates[idx + 30]
+            d_end = available_dates[idx + 31]
+
+            X_train = features[(features.index >= d_start) & (features.index < d_test)]
+            y_up_train = label_up[(label_up.index >= d_start) & (label_up.index < d_test)]
+            y_down_train = label_down[(label_down.index >= d_start) & (label_down.index < d_test)]
+
+            X_test = features[(features.index >= d_test) & (features.index < d_end)]
+            y_up_test = label_up[(label_up.index >= d_test) & (label_up.index < d_end)]
+            y_down_test = label_down[(label_down.index >= d_test) & (label_down.index < d_end)]
+
+            if len(X_test) == 0:
+                continue
+
+            model = self.model_class(self.config.model)
+            model.fit(X_train, y_up_train, y_down_train)
+
+            prob_up = model.predict_proba_up(X_test)
+            prob_down = model.predict_proba_down(X_test)
+
+            # Metrics (usually just 1 sample here)
+            m_up = compute_metrics(y_up_test.values, prob_up)
+            m_down = compute_metrics(y_down_test.values, prob_down)
+            
+            m_up["expected_value"] = compute_expected_value(
+                m_up["precision"], self.config.long_term.up_threshold_pct, 
+                self.config.fees.round_trip_pct, self.config.fees.round_trip_pct
+            )
+            m_down["expected_value"] = compute_expected_value(
+                m_down["precision"], self.config.long_term.down_threshold_pct, 
+                self.config.fees.round_trip_pct, self.config.fees.round_trip_pct
+            )
+
+            m_up["fold"], m_down["fold"] = i + 1, i + 1
+            results_up.append(m_up)
+            results_down.append(m_down)
+
+            cm_up_total += get_confusion_matrix(y_up_test.values, prob_up)
+            cm_down_total += get_confusion_matrix(y_down_test.values, prob_down)
+
+            df_fold = pd.DataFrame({
+                "timestamp": X_test.index,
+                "price_now": close_prices.reindex(X_test.index),
+                "price_future": close_prices.shift(-horizon).reindex(X_test.index),
+                "label_up": y_up_test.values,
+                "label_down": y_down_test.values,
+                "prob_up": prob_up,
+                "prob_down": prob_down,
+            })
+            df_fold["return_pct"] = (df_fold["price_future"] / df_fold["price_now"] - 1) * 100
+            df_fold["pred_up"] = (df_fold["prob_up"] >= 0.5).astype(int)
+            df_fold["pred_down"] = (df_fold["prob_down"] >= 0.5).astype(int)
+            detailed_folds.append(df_fold)
+
+            logger.info("Fold %d: Train %s to %s | Test %s", i+1, d_start.date(), d_test.date(), d_test.date())
+
+        per_fold_up = pd.DataFrame(results_up).set_index("fold")
+        per_fold_down = pd.DataFrame(results_down).set_index("fold")
+        per_fold_up.attrs["confusion_matrix"] = cm_up_total
+        per_fold_down.attrs["confusion_matrix"] = cm_down_total
+
+        return per_fold_up, per_fold_down, aggregate_fold_results(results_up), aggregate_fold_results(results_down), detailed_folds
+

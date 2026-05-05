@@ -11,6 +11,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from btc_ml.config import load_config
@@ -52,14 +54,22 @@ def main() -> None:
 
     logger.info("Feature matrix: %d rows × %d cols", *features.shape)
 
-    # Rolling evaluation — min train = 30 days (lookback window)
+    # Load raw data for price verification
+    try:
+        raw_df = load_parquet(cfg.paths.btc_daily_file)
+        close_prices = raw_df["close"]
+    except FileNotFoundError:
+        logger.warning("Raw daily data not found. Price verification will be limited.")
+        close_prices = pd.Series(dtype=float)
+
+    # Window-based evaluation
     evaluator = RollingEvaluator(model_class=LongTermClassifier, config=cfg)
-    per_fold_up, per_fold_down, summary_up, summary_down = evaluator.evaluate(
+    per_fold_up, per_fold_down, summary_up, summary_down, detailed_folds = evaluator.evaluate_long_term_windows(
         features=features,
         label_up=label_up,
         label_down=label_down,
-        n_folds=n_folds,
-        min_train_size=cfg.long_term.lookback_days,
+        close_prices=close_prices,
+        n_windows=n_folds,
     )
 
     report = ReportGenerator(
@@ -67,10 +77,29 @@ def main() -> None:
         min_precision=cfg.evaluation.min_precision_threshold,
     )
 
-    report.print_fold_results(
-        per_fold_up, per_fold_down, summary_up, summary_down,
-        model_label="Long-Term Next-Day"
-    )
+    if detailed_folds:
+        # For long term, each fold is 1 day. Concatenate to show a summary table and compute aggregate metrics.
+        all_detailed = pd.concat(detailed_folds)
+        
+        # Compute aggregate metrics across all windows
+        from btc_ml.evaluation.metrics import compute_metrics
+        metrics_up = compute_metrics(all_detailed["label_up"], all_detailed["prob_up"])
+        metrics_down = compute_metrics(all_detailed["label_down"], all_detailed["prob_down"])
+        
+        # Update summary for the master comparison table
+        summary_up = {f"{k}_mean": v for k, v in metrics_up.items()}
+        summary_down = {f"{k}_mean": v for k, v in metrics_down.items()}
+
+        report.print_column_explanations()
+        
+        # Print aggregate results instead of per-fold NaNs
+        print("\n" + "=" * 70)
+        print("  LONG-TERM NEXT-DAY — AGGREGATE RESULTS (Across all windows)")
+        print("=" * 70)
+        report._print_summary(summary_up, "UP")
+        report._print_summary(summary_down, "DOWN")
+
+        report.print_detailed_window_analysis(all_detailed, "Long-Term Next-Day", fold_idx="Combined")
 
     report.save_fold_csv(per_fold_up, per_fold_down, filename_prefix="long_term")
 

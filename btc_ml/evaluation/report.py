@@ -43,6 +43,76 @@ class ReportGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.min_precision = min_precision
 
+    def print_column_explanations(self) -> None:
+        """Print definitions for the columns in the report."""
+        explanations = [
+            ["Folds", "Rolling test windows. Each fold trains on past data and tests on 'future' data."],
+            ["n_pos", "Number of positive instances (e.g., price actually went UP) in the test fold."],
+            ["n_neg", "Number of negative instances (e.g., price DID NOT go UP) in the test fold."],
+            ["Expected Value", "Avg profit/loss % per trade after precision, avg moves, and fees (0.62%)."],
+            ["n_samples", "Total number of test samples in the fold (e.g., 60 mins for short-term)."]
+        ]
+        print("\n" + "=" * 80)
+        print("  REPORT COLUMN DEFINITIONS")
+        print("=" * 80)
+        print(tabulate(explanations, headers=["Column", "Definition"], tablefmt="rounded_outline"))
+        print()
+
+    def print_detailed_window_analysis(self, detailed_df: pd.DataFrame, model_label: str, fold_idx: int = 1) -> None:
+        """Print a sample-by-sample table for a specific fold (window)."""
+        print(f"\n{'=' * 95}")
+        print(f"  {model_label.upper()} — DEEP DIVE: FOLD {fold_idx} (First 20 samples)")
+        print(f"{'=' * 95}")
+        
+        # Format for display
+        display = detailed_df.copy()
+        display["Time"] = display["timestamp"].dt.strftime("%H:%M:%S")
+        display["Correct UP"] = (display["pred_up"] == display["label_up"]).map({True: "✅", False: "❌"})
+        
+        cols = ["Time", "price_now", "price_future", "return_pct", "pred_up", "label_up", "Correct UP"]
+        # Rename for cleaner table
+        rename_map = {
+            "price_now": "Price (T)",
+            "price_future": "Price (T+15)",
+            "return_pct": "Ret %",
+            "pred_up": "Pred",
+            "label_up": "Target"
+        }
+        display = display.rename(columns=rename_map)
+        final_cols = ["Time", "Price (T)", "Price (T+15)", "Ret %", "Pred", "Target", "Correct UP"]
+        
+        print(tabulate(display[final_cols].head(20), headers=final_cols, tablefmt="rounded_outline", floatfmt=".2f"))
+        if len(display) > 20:
+            print(f"  ... and {len(display)-20} more rows in this fold.")
+
+    def plot_short_term_predictions(self, detailed_df: pd.DataFrame, filename: str) -> None:
+        """Plot price vs model signals for a short-term window."""
+        df = detailed_df.copy()
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Price line
+        ax.plot(df["timestamp"], df["price_now"], color="#c9d1d9", label="Price", alpha=0.8)
+        
+        # Signals
+        up_signals = df[df["pred_up"] == 1]
+        down_signals = df[df["pred_down"] == 1]
+        
+        if not up_signals.empty:
+            ax.scatter(up_signals["timestamp"], up_signals["price_now"], color="#22c55e", marker="^", s=80, label="Pred UP")
+        if not down_signals.empty:
+            ax.scatter(down_signals["timestamp"], down_signals["price_now"], color="#ef4444", marker="v", s=80, label="Pred DOWN")
+        
+        ax.set_title("Short-Term Window: Price & Signal Verification", color="#f0b429", fontsize=14)
+        ax.set_ylabel("BTC Price ($)")
+        ax.set_xlabel("Time (Window)")
+        ax.legend()
+        plt.xticks(rotation=45)
+        
+        path = self.output_dir / filename
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        logger.info("Saved signal verification plot → %s", path)
+
     # ── Main report entry points ──────────────────────────────────────────────
 
     def print_sentiment_table(self, sentiment: pd.DataFrame) -> None:

@@ -11,6 +11,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from btc_ml.config import load_config
@@ -53,14 +55,22 @@ def main() -> None:
 
     logger.info("Feature matrix: %d rows × %d cols", *features.shape)
 
-    # Rolling evaluation
+    # Load raw data for price verification
+    try:
+        raw_df = load_parquet(cfg.paths.btc_1min_file)
+        close_prices = raw_df["close"]
+    except FileNotFoundError:
+        logger.warning("Raw 1-min data not found. Price verification will be limited.")
+        close_prices = pd.Series(dtype=float)
+
+    # Window-based evaluation
     evaluator = RollingEvaluator(model_class=ShortTermClassifier, config=cfg)
-    per_fold_up, per_fold_down, summary_up, summary_down = evaluator.evaluate(
+    per_fold_up, per_fold_down, summary_up, summary_down, detailed_folds = evaluator.evaluate_short_term_windows(
         features=features,
         label_up=label_up,
         label_down=label_down,
-        n_folds=n_folds,
-        min_train_size=max(int(len(features) * 0.60), cfg.short_term.lookback_candles * 10),
+        close_prices=close_prices,
+        n_windows=n_folds,
     )
 
     # Reports
@@ -69,10 +79,16 @@ def main() -> None:
         min_precision=cfg.evaluation.min_precision_threshold,
     )
 
+    report.print_column_explanations()
+
     report.print_fold_results(
         per_fold_up, per_fold_down, summary_up, summary_down,
         model_label="Short-Term 15-Minute"
     )
+
+    if detailed_folds:
+        report.print_detailed_window_analysis(detailed_folds[0], "Short-Term 15-Minute", fold_idx=1)
+        report.plot_short_term_predictions(detailed_folds[0], "short_term_fold_1_signals.png")
 
     report.save_fold_csv(per_fold_up, per_fold_down, filename_prefix="short_term")
 
